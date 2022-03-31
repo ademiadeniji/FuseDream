@@ -30,7 +30,17 @@ import datasets as dset
 def prepare_parser():
   usage = 'Parser for all scripts.'
   parser = ArgumentParser(description=usage)
-  
+  parser.add_argument(
+    '--device', type=str, default="cuda:0")
+  parser.add_argument(
+    '--dataset_name', type=str, default="")
+  parser.add_argument(
+    '--loss_type', type=str, default="clip") # clip, reconstruct_l2, reconstruct_clip, reconstruct_lpips, joint
+  parser.add_argument(
+    '--wandb', action='store_true', default=False)
+  parser.add_argument(
+    '--experiment', type=str, default="experiment")
+
   ### Dataset/Dataloader stuff ###
   parser.add_argument(
     '--dataset', type=str, default='I128_hdf5',
@@ -886,12 +896,12 @@ def sample_sheet(G, classes_per_sheet, num_classes, samples_per_class, parallel,
   # loop over total number of sheets
   for i in range(num_classes // classes_per_sheet):
     ims = []
-    y = torch.arange(i * classes_per_sheet, (i + 1) * classes_per_sheet, device='cuda')
+    y = torch.arange(i * classes_per_sheet, (i + 1) * classes_per_sheet, device=G.device)
     for j in range(samples_per_class):
       if (z_ is not None) and hasattr(z_, 'sample_') and classes_per_sheet <= z_.size(0):
         z_.sample_()
       else:
-        z_ = torch.randn(classes_per_sheet, G.dim_z, device='cuda')        
+        z_ = torch.randn(classes_per_sheet, G.dim_z, device=G.device)        
       with torch.no_grad():
         if parallel:
           o = nn.parallel.data_parallel(G, (z_[:classes_per_sheet], G.shared(y)))
@@ -923,11 +933,11 @@ def interp_sheet(G, num_per_sheet, num_midpoints, num_classes, parallel,
                  fix_z=False, fix_y=False, device='cuda'):
   # Prepare zs and ys
   if fix_z: # If fix Z, only sample 1 z per row
-    zs = torch.randn(num_per_sheet, 1, G.dim_z, device=device)
+    zs = torch.randn(num_per_sheet, 1, G.dim_z, device=G.device)
     zs = zs.repeat(1, num_midpoints + 2, 1).view(-1, G.dim_z)
   else:
-    zs = interp(torch.randn(num_per_sheet, 1, G.dim_z, device=device),
-                torch.randn(num_per_sheet, 1, G.dim_z, device=device),
+    zs = interp(torch.randn(num_per_sheet, 1, G.dim_z, device=G.device),
+                torch.randn(num_per_sheet, 1, G.dim_z, device=G.device),
                 num_midpoints).view(-1, G.dim_z)
   if fix_y: # If fix y, only sample 1 z per row
     ys = sample_1hot(num_per_sheet, num_classes)

@@ -3,20 +3,41 @@ from tqdm import tqdm
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 import torchvision
 import BigGAN_utils.utils as utils
-import clip
+import clip.clip
 import torch.nn.functional as F
 from DiffAugment_pytorch import DiffAugment
 import numpy as np
 import lpips
+import wandb
 
 LATENT_NOISE = 0.01
 Z_THRES = 2.0
 POLICY = 'color,translation,resize,cutout'
 TEST_POLICY = 'color,translation,resize,cutout'
-mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
-std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
 
-def AugmentLoss(img, clip_model, text, replicate=10, interp_mode='bilinear', policy=POLICY):
+def ReconstructionLoss(img, target, clip_model, mean, std, interp_mode, loss_type, lpips=None):
+    if loss_type == "reconstruct_l2":
+        loss = torch.sum((img - target)**2, dim=[1, 2, 3])
+        loss = torch.sqrt(loss)
+        mag = torch.sqrt(torch.sum((target)**2, dim=(1,2,3)))
+        loss = loss / mag
+    elif loss_type == "reconstruct_clip":
+        img = (img+1.)/2.
+        img = F.interpolate(img, size=224, mode=interp_mode)
+        img.sub_(mean[None, :, None, None]).div_(std[None, :, None, None])
+        target = (target+1.)/2.
+        target = F.interpolate(target, size=224, mode=interp_mode)
+        target.sub_(mean[None, :, None, None]).div_(std[None, :, None, None])
+        img_encoding = clip_model.encode_image(img)
+        target_encoding = clip_model.encode_image(target)
+        loss = -torch.sum(img_encoding * target_encoding, -1) / (torch.norm(img_encoding) * torch.norm(target_encoding))
+    elif loss_type == "reconstruct_lpips":
+        loss = lpips(img, target)
+    else:
+        raise ValueError("Invalid loss type specified")
+    return loss
+
+def AugmentLoss(img, clip_model, text, mean, std, replicate=10, interp_mode='bilinear', policy=POLICY):
 
     clip_c = clip_model.logit_scale.exp()
     img_aug = DiffAugment(img.repeat(replicate, 1, 1, 1), policy=policy)
@@ -30,7 +51,7 @@ def AugmentLoss(img, clip_model, text, replicate=10, interp_mode='bilinear', pol
      
     return concept_loss.mean(dim=0, keepdim=False)
 
-def NaiveSemanticLoss(img, clip_model, text, interp_mode='bilinear'):
+def NaiveSemanticLoss(img, clip_model, text, mean, std, interp_mode='bilinear'):
 
     clip_c = clip_model.logit_scale.exp()
     img = (img+1.)/2.
@@ -65,7 +86,7 @@ def save_image(img, path, n_per_row=1):
             normalize=True,
         )
 
-def get_G(resolution=256):
+def get_G(resolution=256, device="cuda:0"):
     if resolution == 256:
         parser = utils.prepare_parser()
         parser = utils.add_sample_parser(parser)
@@ -87,7 +108,7 @@ def get_G(resolution=256):
         config = utils.update_config_roots(config)
         config["skip_init"] = True
         config["no_optim"] = True
-        config["device"] = "cuda"
+        config["device"] = device
         config["resolution"] = 256
 
         # Set up cudnn.benchmark for free speed.
@@ -122,7 +143,7 @@ def get_G(resolution=256):
         config = utils.update_config_roots(config)
         config["skip_init"] = True
         config["no_optim"] = True
-        config["device"] = "cuda"
+        config["device"] = device
 
         # Set up cudnn.benchmark for free speed.
         torch.backends.cudnn.benchmark = True
@@ -142,18 +163,26 @@ def get_G(resolution=256):
     return G, config
 
 class FuseDreamBaseGenerator():
-    def __init__(self, G, G_config, G_batch_size=10, clip_mode="ViT-B/32", interp_mode='bilinear'):
+    def __init__(self, G, G_config, G_batch_size=10, device="cuda:0", clip_mode="ViT-B/32", interp_mode='bilinear', use_wandb=False, target=None, loss_type="clip"):
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.G = G
         self.clip_model, _ = clip.load(clip_mode, device=device) 
-        
+        self.mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda(device=device)
+        self.std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda(device=device)
+        self.use_wandb = use_wandb
+        self.target = target
+        self.loss_type = loss_type
+        if self.loss_type == "reconstruct_lpips":
+            self.lpips = lpips.LPIPS(net='vgg').to(device)
+        else:
+            self.lpips = None
+
         (self.z_, self.y_) = utils.prepare_z_y(
             G_batch_size,
             self.G.dim_z,
             G_config["n_classes"],
-            device=G_config["device"],
+            device=device,
             fp16=G_config["G_fp16"],
             z_var=G_config["z_var"],
         )
@@ -170,7 +199,6 @@ class FuseDreamBaseGenerator():
     def generate_basis(self, text, init_iters=500, num_basis=5):
         text_tok = clip.tokenize([text]).to(self.device)
         clip_c = self.clip_model.logit_scale.exp() 
-
         z_init_cllt = []
         y_init_cllt = []
         z_init = None
@@ -184,12 +212,16 @@ class FuseDreamBaseGenerator():
                 self.z_.data = torch.clamp(self.z_.data.detach().clone(), min=-Z_THRES, max=Z_THRES)
 
                 image_tensors = self.G(self.z_, self.G.shared(self.y_))
-                image_tensors = (image_tensors+1.) / 2.
-                image_tensors = F.interpolate(image_tensors, size=224, mode=self.interp_mode)
-                image_tensors.sub_(mean[None, :, None, None]).div_(std[None, :, None, None])
-                
-                logits_per_image, logits_per_text = self.clip_model(image_tensors, text_tok)
-                logits_per_image = logits_per_image/clip_c
+                if "reconstruct" in self.loss_type and False:
+                    logits_per_image = -ReconstructionLoss(image_tensors, self.target, self.clip_model, self.mean,
+                        self.std, self.interp_mode, self.loss_type)
+                else:
+                    image_tensors = (image_tensors+1.) / 2.
+                    image_tensors = F.interpolate(image_tensors, size=224, mode=self.interp_mode)
+                    image_tensors.sub_(self.mean[None, :, None, None]).div_(self.std[None, :, None, None])
+                    logits_per_image, logits_per_text = self.clip_model(image_tensors, text_tok)
+                    logits_per_image = logits_per_image/clip_c
+
                 if z_init is None:
                     z_init = self.z_.data.detach().clone()
                     y_init = self.y_.data.detach().clone()
@@ -272,13 +304,23 @@ class FuseDreamBaseGenerator():
             
             loss = 0.0
             for j in range(image_tensors.shape[0]):
-                if augment:
-                    loss = loss + AugmentLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, replicate=50, interp_mode=self.interp_mode)
+                if "reconstruct" in self.loss_type or self.loss_type == "joint":
+                    recons_loss = ReconstructionLoss(image_tensors[j:(j+1)], self.target, self.clip_model, self.mean, self.std, self.interp_mode, self.loss_type, self.lpips)
+                    recons_loss = torch.mean(recons_loss, axis=0)
+                else: 
+                    recons_loss = 0.0
+                if self.loss_type == "clip" or self.loss_type == "joint":
+                    if augment:
+                        clip_loss = AugmentLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, self.mean, self.std, replicate=50, interp_mode=self.interp_mode)
+                    else:
+                        clip_loss = NaiveSemanticLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, self.mean, self.std) 
                 else:
-                    loss = loss + NaiveSemanticLoss(image_tensors[j:(j+1)], self.clip_model, text_tok) 
-
+                    clip_loss = 0.0
+                loss = loss + clip_loss + recons_loss
             loss.backward()
             optimizer.step()
+            if self.use_wandb:
+                wandb.log({"loss":loss, "clip_loss":clip_loss, "recons_loss":recons_loss}, step=i)
 
             opt_z.data = torch.clamp(opt_z.data.detach().clone(), min=-Z_THRES, max=Z_THRES)
 
@@ -296,9 +338,9 @@ class FuseDreamBaseGenerator():
 
             for j in range(image_tensors.shape[0]):
                 if augment:
-                    loss = AugmentLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, replicate=50, interp_mode=self.interp_mode, policy=TEST_POLICY)
+                    loss = AugmentLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, self.mean, self.std, replicate=50, interp_mode=self.interp_mode, policy=TEST_POLICY)
                 else:
-                    loss = NaiveSemanticLoss(image_tensors[j:(j+1)], self.clip_model, text_tok) 
+                    loss = NaiveSemanticLoss(image_tensors[j:(j+1)], self.clip_model, text_tok, self.mean, self.std) 
             avg_loss += loss.item()
 
         avg_loss /= num_samples
